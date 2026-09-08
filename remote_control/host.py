@@ -119,8 +119,12 @@ class RemoteHost:
             await websocket.send(first.jpeg)
             self.status_callback(f"Controller connected: {peer}")
 
-            sender = asyncio.create_task(self._frame_sender(websocket, capture))
+            # Run screen output and control input as independent tasks.  The frame
+            # sender explicitly yields on every iteration because websocket.send()
+            # isn't guaranteed to suspend when socket buffers have room.  Without
+            # this, a fast capture/send loop can starve _control_receiver entirely.
             receiver = asyncio.create_task(self._control_receiver(websocket))
+            sender = asyncio.create_task(self._frame_sender(websocket, capture))
             done, pending = await asyncio.wait({sender, receiver}, return_when=asyncio.FIRST_COMPLETED)
             for task in pending:
                 task.cancel()
@@ -145,13 +149,26 @@ class RemoteHost:
 
     async def _frame_sender(self, websocket: ServerConnection, capture: ScreenCapture) -> None:
         delay = 1 / self.fps
+        next_frame_at = time.monotonic()
+
         while True:
-            started = time.monotonic()
+            # Always yield before doing synchronous capture/JPEG work.  This is
+            # important even though websocket.send() is awaited: send() may finish
+            # immediately and therefore doesn't guarantee fairness to the receiver.
+            await asyncio.sleep(0)
+
             frame = capture.capture()
             await websocket.send(frame.jpeg)
-            remaining = delay - (time.monotonic() - started)
+
+            next_frame_at += delay
+            remaining = next_frame_at - time.monotonic()
             if remaining > 0:
                 await asyncio.sleep(remaining)
+            else:
+                # If capture/compression is slower than the requested frame rate,
+                # don't busy-loop trying to catch up.  Reset the schedule and yield.
+                next_frame_at = time.monotonic()
+                await asyncio.sleep(0)
 
     async def _control_receiver(self, websocket: ServerConnection) -> None:
         async for raw in websocket:
