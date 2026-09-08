@@ -16,6 +16,9 @@ from .platform_io import local_ip, normalise_key
 from .protocol import RemoteGeometry
 
 DEFAULT_PORT = 8765
+MIN_ZOOM = 0.25
+MAX_ZOOM = 3.0
+ZOOM_STEP = 0.25
 
 
 class RemoteControlApp(tk.Tk):
@@ -34,30 +37,43 @@ class RemoteControlApp(tk.Tk):
         self.remote_geometry: RemoteGeometry | None = None
         self.remote_photo: ImageTk.PhotoImage | None = None
         self.remote_image_size = (1, 1)
+        self.remote_image_origin = (0, 0)
         self.last_mouse_sent: tuple[int, int] | None = None
         self._last_frame: Image.Image | None = None
+        self._placeholder_text = "Connect to a host to view its screen."
+
+        self.zoom_mode = "fit"
+        self.zoom_scale = 1.0
+        self.zoom_text = tk.StringVar(value="Fit")
+
+        self.fullscreen_window: tk.Toplevel | None = None
+        self.fullscreen_canvas: tk.Canvas | None = None
+        self.fullscreen_hscroll: ttk.Scrollbar | None = None
+        self.fullscreen_vscroll: ttk.Scrollbar | None = None
 
         self._build_ui()
+        self.bind("<F11>", lambda _e: self._toggle_fullscreen())
+        self.bind("<Escape>", lambda _e: self._exit_fullscreen())
         self.after(30, self._drain_ui_queue)
         self.after(15, self._refresh_frame)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build_ui(self) -> None:
-        outer = ttk.Frame(self, padding=12)
-        outer.pack(fill="both", expand=True)
-        outer.columnconfigure(0, weight=1)
-        outer.rowconfigure(1, weight=1)
+        self.outer = ttk.Frame(self, padding=12)
+        self.outer.pack(fill="both", expand=True)
+        self.outer.columnconfigure(0, weight=1)
+        self.outer.rowconfigure(1, weight=1)
 
-        header = ttk.Frame(outer)
-        header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        self.header = ttk.Frame(self.outer)
+        self.header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
         ttk.Label(
-            header,
+            self.header,
             text="LAN Remote Control",
             font=("TkDefaultFont", 18, "bold"),
         ).pack(side="left")
-        ttk.Label(header, text=f"v{__version__}").pack(side="right")
+        ttk.Label(self.header, text=f"v{__version__}").pack(side="right")
 
-        self.notebook = ttk.Notebook(outer)
+        self.notebook = ttk.Notebook(self.outer)
         self.notebook.grid(row=1, column=0, sticky="nsew")
 
         self.host_tab = ttk.Frame(self.notebook, padding=14)
@@ -69,12 +85,13 @@ class RemoteControlApp(tk.Tk):
         self._build_control_tab()
 
         self.global_status = tk.StringVar(value="Ready")
-        ttk.Label(
-            outer,
+        self.status_label = ttk.Label(
+            self.outer,
             textvariable=self.global_status,
             relief="sunken",
             anchor="w",
-        ).grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        )
+        self.status_label.grid(row=2, column=0, sticky="ew", pady=(8, 0))
 
     def _build_host_tab(self) -> None:
         frame = self.host_tab
@@ -101,63 +118,33 @@ class RemoteControlApp(tk.Tk):
         ]
         for row, (label, variable) in enumerate(labels, start=1):
             ttk.Label(frame, text=label).grid(
-                row=row,
-                column=0,
-                sticky="w",
-                padx=(0, 10),
-                pady=5,
+                row=row, column=0, sticky="w", padx=(0, 10), pady=5
             )
             entry = ttk.Entry(frame, textvariable=variable, width=42)
             entry.grid(row=row, column=1, sticky="ew", pady=5)
             if label == "LAN IP":
                 entry.state(["readonly"])
 
-        ttk.Button(
-            frame,
-            text="New token",
-            command=self._new_token,
-        ).grid(row=3, column=2, padx=(8, 0), pady=5)
-
-        ttk.Label(frame, text="Frame rate").grid(
-            row=4, column=0, sticky="w", pady=5
+        ttk.Button(frame, text="New token", command=self._new_token).grid(
+            row=3, column=2, padx=(8, 0), pady=5
         )
-        ttk.Spinbox(
-            frame,
-            from_=2,
-            to=30,
-            textvariable=self.host_fps,
-            width=8,
-        ).grid(row=4, column=1, sticky="w", pady=5)
 
-        ttk.Label(frame, text="JPEG quality").grid(
-            row=5, column=0, sticky="w", pady=5
+        ttk.Label(frame, text="Frame rate").grid(row=4, column=0, sticky="w", pady=5)
+        ttk.Spinbox(frame, from_=2, to=30, textvariable=self.host_fps, width=8).grid(
+            row=4, column=1, sticky="w", pady=5
         )
-        ttk.Spinbox(
-            frame,
-            from_=25,
-            to=90,
-            textvariable=self.host_quality,
-            width=8,
-        ).grid(row=5, column=1, sticky="w", pady=5)
+
+        ttk.Label(frame, text="JPEG quality").grid(row=5, column=0, sticky="w", pady=5)
+        ttk.Spinbox(frame, from_=25, to=90, textvariable=self.host_quality, width=8).grid(
+            row=5, column=1, sticky="w", pady=5
+        )
 
         buttons = ttk.Frame(frame)
         buttons.grid(row=6, column=0, columnspan=3, sticky="w", pady=(16, 8))
-
-        self.start_host_btn = ttk.Button(
-            buttons,
-            text="Start hosting",
-            command=self._start_host,
-        )
+        self.start_host_btn = ttk.Button(buttons, text="Start hosting", command=self._start_host)
         self.start_host_btn.pack(side="left")
-
-        self.stop_host_btn = ttk.Button(
-            buttons,
-            text="Stop",
-            command=self._stop_host,
-            state="disabled",
-        )
+        self.stop_host_btn = ttk.Button(buttons, text="Stop", command=self._stop_host, state="disabled")
         self.stop_host_btn.pack(side="left", padx=(8, 0))
-
         self.host_take_control_btn = ttk.Button(
             buttons,
             text="Take control of connected computer",
@@ -166,54 +153,29 @@ class RemoteControlApp(tk.Tk):
         )
         self.host_take_control_btn.pack(side="left", padx=(18, 0))
 
-        ttk.Separator(frame).grid(
-            row=7,
-            column=0,
-            columnspan=3,
-            sticky="ew",
-            pady=12,
-        )
-
+        ttk.Separator(frame).grid(row=7, column=0, columnspan=3, sticky="ew", pady=12)
         ttk.Label(frame, text="Connection:").grid(row=8, column=0, sticky="nw")
-        ttk.Label(
-            frame,
-            textvariable=self.host_status,
-            wraplength=760,
-            justify="left",
-        ).grid(row=8, column=1, columnspan=2, sticky="w")
-
-        ttk.Label(frame, text="Control direction:").grid(
-            row=9, column=0, sticky="nw", pady=(8, 0)
+        ttk.Label(frame, textvariable=self.host_status, wraplength=760, justify="left").grid(
+            row=8, column=1, columnspan=2, sticky="w"
         )
-        ttk.Label(
-            frame,
-            textvariable=self.host_role,
-            wraplength=760,
-            justify="left",
-        ).grid(row=9, column=1, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Label(frame, text="Control direction:").grid(row=9, column=0, sticky="nw", pady=(8, 0))
+        ttk.Label(frame, textvariable=self.host_role, wraplength=760, justify="left").grid(
+            row=9, column=1, columnspan=2, sticky="w", pady=(8, 0)
+        )
 
         help_text = (
-            "For a locked-down office PC, start hosting on the Mac and make the "
-            "Windows PC connect outbound to it. The WebSocket remains open. While "
-            "Windows is controlling the Mac, press 'Take control of connected computer' "
-            "here to reverse the screen and input direction without opening an inbound "
-            "Windows firewall port."
+            "For a locked-down office PC, start hosting on the Mac and make the Windows PC "
+            "connect outbound to it. The WebSocket remains open. Use 'Take control' to reverse "
+            "screen and input direction without opening an inbound Windows firewall port."
         )
-        ttk.Label(
-            frame,
-            text=help_text,
-            wraplength=820,
-            justify="left",
-        ).grid(row=10, column=0, columnspan=3, sticky="w", pady=(18, 0))
+        ttk.Label(frame, text=help_text, wraplength=820, justify="left").grid(
+            row=10, column=0, columnspan=3, sticky="w", pady=(18, 0)
+        )
 
     def _build_control_tab(self) -> None:
         frame = self.control_tab
         frame.columnconfigure(0, weight=1)
-        frame.rowconfigure(2, weight=1)
-
-        toolbar = ttk.Frame(frame)
-        toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        toolbar.columnconfigure(1, weight=1)
+        frame.rowconfigure(3, weight=1)
 
         self.connect_host = tk.StringVar(value="")
         self.connect_port = tk.StringVar(value=str(DEFAULT_PORT))
@@ -221,41 +183,22 @@ class RemoteControlApp(tk.Tk):
         self.client_status = tk.StringVar(value="Not connected")
         self.control_direction = tk.StringVar(value="No active remote-control session")
 
+        toolbar = ttk.Frame(frame)
+        toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        toolbar.columnconfigure(1, weight=1)
         ttk.Label(toolbar, text="Host").grid(row=0, column=0, padx=(0, 4))
-        ttk.Entry(
-            toolbar,
-            textvariable=self.connect_host,
-            width=18,
-        ).grid(row=0, column=1, sticky="ew", padx=(0, 8))
-
+        ttk.Entry(toolbar, textvariable=self.connect_host, width=18).grid(
+            row=0, column=1, sticky="ew", padx=(0, 8)
+        )
         ttk.Label(toolbar, text="Port").grid(row=0, column=2, padx=(0, 4))
-        ttk.Entry(
-            toolbar,
-            textvariable=self.connect_port,
-            width=7,
-        ).grid(row=0, column=3, padx=(0, 8))
-
+        ttk.Entry(toolbar, textvariable=self.connect_port, width=7).grid(row=0, column=3, padx=(0, 8))
         ttk.Label(toolbar, text="Token").grid(row=0, column=4, padx=(0, 4))
-        ttk.Entry(
-            toolbar,
-            textvariable=self.connect_token,
-            width=20,
-            show="•",
-        ).grid(row=0, column=5, padx=(0, 8))
-
-        self.connect_btn = ttk.Button(
-            toolbar,
-            text="Connect",
-            command=self._connect,
+        ttk.Entry(toolbar, textvariable=self.connect_token, width=20, show="•").grid(
+            row=0, column=5, padx=(0, 8)
         )
+        self.connect_btn = ttk.Button(toolbar, text="Connect", command=self._connect)
         self.connect_btn.grid(row=0, column=6)
-
-        self.disconnect_btn = ttk.Button(
-            toolbar,
-            text="Disconnect",
-            command=self._disconnect,
-            state="disabled",
-        )
+        self.disconnect_btn = ttk.Button(toolbar, text="Disconnect", command=self._disconnect, state="disabled")
         self.disconnect_btn.grid(row=0, column=7, padx=(8, 0))
 
         direction_bar = ttk.Frame(frame)
@@ -265,7 +208,6 @@ class RemoteControlApp(tk.Tk):
             textvariable=self.control_direction,
             font=("TkDefaultFont", 10, "bold"),
         ).pack(side="left")
-
         self.take_control_btn = ttk.Button(
             direction_bar,
             text="Take control",
@@ -274,74 +216,157 @@ class RemoteControlApp(tk.Tk):
         )
         self.take_control_btn.pack(side="right")
 
+        viewer_toolbar = ttk.Frame(frame)
+        viewer_toolbar.grid(row=2, column=0, sticky="ew", pady=(0, 6))
+        self._populate_viewer_toolbar(viewer_toolbar, fullscreen=False)
+
         viewer_border = ttk.Frame(frame, relief="sunken", borderwidth=1)
-        viewer_border.grid(row=2, column=0, sticky="nsew")
+        viewer_border.grid(row=3, column=0, sticky="nsew")
         viewer_border.rowconfigure(0, weight=1)
         viewer_border.columnconfigure(0, weight=1)
 
-        self.canvas = tk.Canvas(
-            viewer_border,
-            background="black",
-            highlightthickness=0,
-            takefocus=True,
-        )
+        self.canvas = tk.Canvas(viewer_border, background="black", highlightthickness=0, takefocus=True)
         self.canvas.grid(row=0, column=0, sticky="nsew")
-        self.canvas.create_text(
-            20,
-            20,
-            anchor="nw",
-            fill="white",
-            text="Connect to a host to view its screen.",
-            tags="placeholder",
-        )
-
-        self.canvas.bind("<Configure>", lambda _e: self._redraw_last_frame())
-        self.canvas.bind("<Motion>", self._mouse_move)
-        self.canvas.bind(
-            "<ButtonPress-1>",
-            lambda e: self._mouse_button(e, "left", True),
-        )
-        self.canvas.bind(
-            "<ButtonRelease-1>",
-            lambda e: self._mouse_button(e, "left", False),
-        )
-        self.canvas.bind(
-            "<ButtonPress-2>",
-            lambda e: self._mouse_button(e, "middle", True),
-        )
-        self.canvas.bind(
-            "<ButtonRelease-2>",
-            lambda e: self._mouse_button(e, "middle", False),
-        )
-        self.canvas.bind(
-            "<ButtonPress-3>",
-            lambda e: self._mouse_button(e, "right", True),
-        )
-        self.canvas.bind(
-            "<ButtonRelease-3>",
-            lambda e: self._mouse_button(e, "right", False),
-        )
-        self.canvas.bind("<MouseWheel>", self._mouse_wheel)
-        self.canvas.bind("<Button-4>", lambda _e: self._send_scroll(1))
-        self.canvas.bind("<Button-5>", lambda _e: self._send_scroll(-1))
-        self.canvas.bind("<KeyPress>", self._key_down)
-        self.canvas.bind("<KeyRelease>", self._key_up)
+        self.main_hscroll = ttk.Scrollbar(viewer_border, orient="horizontal", command=self.canvas.xview)
+        self.main_vscroll = ttk.Scrollbar(viewer_border, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(xscrollcommand=self.main_hscroll.set, yscrollcommand=self.main_vscroll.set)
+        self._bind_canvas(self.canvas)
+        self._set_canvas_placeholder(self.canvas, self._placeholder_text)
+        self._update_scrollbars(self.canvas)
 
         footer = ttk.Frame(frame)
-        footer.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        footer.grid(row=4, column=0, sticky="ew", pady=(8, 0))
         ttk.Label(footer, textvariable=self.client_status).pack(side="left")
+        ttk.Button(footer, text="Send clipboard", command=self._send_clipboard).pack(side="right")
+        ttk.Button(footer, text="Get clipboard", command=self._get_clipboard).pack(side="right", padx=(0, 8))
 
-        ttk.Button(
-            footer,
-            text="Send clipboard",
-            command=self._send_clipboard,
-        ).pack(side="right")
+    def _populate_viewer_toolbar(self, parent: ttk.Frame, *, fullscreen: bool) -> None:
+        ttk.Button(parent, text="Fit", command=self._zoom_fit).pack(side="left")
+        ttk.Button(parent, text="−", width=3, command=lambda: self._zoom_by(-ZOOM_STEP)).pack(side="left", padx=(6, 0))
+        ttk.Label(parent, textvariable=self.zoom_text, width=8, anchor="center").pack(side="left", padx=4)
+        ttk.Button(parent, text="+", width=3, command=lambda: self._zoom_by(ZOOM_STEP)).pack(side="left")
+        ttk.Button(parent, text="100%", command=lambda: self._set_zoom(1.0)).pack(side="left", padx=(6, 0))
+        if fullscreen:
+            ttk.Label(parent, text="Esc to exit").pack(side="right", padx=(0, 10))
+            ttk.Button(parent, text="Exit Full Screen", command=self._exit_fullscreen).pack(side="right")
+        else:
+            ttk.Button(parent, text="Full Screen", command=self._enter_fullscreen).pack(side="right")
+            ttk.Label(parent, text="F11").pack(side="right", padx=(0, 8))
 
-        ttk.Button(
-            footer,
-            text="Get clipboard",
-            command=self._get_clipboard,
-        ).pack(side="right", padx=(0, 8))
+    def _bind_canvas(self, canvas: tk.Canvas) -> None:
+        canvas.bind("<Configure>", lambda _e: self._redraw_last_frame())
+        canvas.bind("<Motion>", self._mouse_move)
+        canvas.bind("<ButtonPress-1>", lambda e: self._mouse_button(e, "left", True))
+        canvas.bind("<ButtonRelease-1>", lambda e: self._mouse_button(e, "left", False))
+        canvas.bind("<ButtonPress-2>", lambda e: self._mouse_button(e, "middle", True))
+        canvas.bind("<ButtonRelease-2>", lambda e: self._mouse_button(e, "middle", False))
+        canvas.bind("<ButtonPress-3>", lambda e: self._mouse_button(e, "right", True))
+        canvas.bind("<ButtonRelease-3>", lambda e: self._mouse_button(e, "right", False))
+        canvas.bind("<MouseWheel>", self._mouse_wheel)
+        canvas.bind("<Button-4>", lambda _e: self._send_scroll(1))
+        canvas.bind("<Button-5>", lambda _e: self._send_scroll(-1))
+        canvas.bind("<KeyPress>", self._key_down)
+        canvas.bind("<KeyRelease>", self._key_up)
+
+    def _active_canvas(self) -> tk.Canvas:
+        if self.fullscreen_window is not None and self.fullscreen_canvas is not None:
+            return self.fullscreen_canvas
+        return self.canvas
+
+    def _scrollbars_for_canvas(self, canvas: tk.Canvas):
+        if canvas is self.canvas:
+            return self.main_hscroll, self.main_vscroll
+        return self.fullscreen_hscroll, self.fullscreen_vscroll
+
+    def _update_scrollbars(self, canvas: tk.Canvas) -> None:
+        hscroll, vscroll = self._scrollbars_for_canvas(canvas)
+        if hscroll is None or vscroll is None:
+            return
+        if self.zoom_mode == "fit":
+            hscroll.grid_remove()
+            vscroll.grid_remove()
+        else:
+            hscroll.grid(row=1, column=0, sticky="ew")
+            vscroll.grid(row=0, column=1, sticky="ns")
+
+    def _zoom_fit(self) -> None:
+        self.zoom_mode = "fit"
+        self.zoom_text.set("Fit")
+        self._redraw_last_frame(reset_view=True)
+
+    def _set_zoom(self, scale: float) -> None:
+        self.zoom_mode = "manual"
+        self.zoom_scale = min(MAX_ZOOM, max(MIN_ZOOM, float(scale)))
+        self.zoom_text.set(f"{round(self.zoom_scale * 100)}%")
+        self._redraw_last_frame(reset_view=True)
+
+    def _zoom_by(self, delta: float) -> None:
+        if self.zoom_mode == "fit":
+            if self._last_frame is not None:
+                canvas = self._active_canvas()
+                cw = max(canvas.winfo_width(), 1)
+                ch = max(canvas.winfo_height(), 1)
+                self.zoom_scale = min(cw / self._last_frame.width, ch / self._last_frame.height)
+            else:
+                self.zoom_scale = 1.0
+        self._set_zoom(self.zoom_scale + delta)
+
+    def _toggle_fullscreen(self) -> None:
+        if self.fullscreen_window is None:
+            self._enter_fullscreen()
+        else:
+            self._exit_fullscreen()
+
+    def _enter_fullscreen(self) -> None:
+        if self.fullscreen_window is not None:
+            return
+        win = tk.Toplevel(self)
+        self.fullscreen_window = win
+        win.title("Remote Control - Full Screen")
+        win.attributes("-fullscreen", True)
+        win.configure(background="black")
+        win.rowconfigure(1, weight=1)
+        win.columnconfigure(0, weight=1)
+        win.bind("<Escape>", lambda _e: self._exit_fullscreen())
+        win.bind("<F11>", lambda _e: self._exit_fullscreen())
+        win.protocol("WM_DELETE_WINDOW", self._exit_fullscreen)
+
+        bar = ttk.Frame(win, padding=(8, 6))
+        bar.grid(row=0, column=0, sticky="ew")
+        self._populate_viewer_toolbar(bar, fullscreen=True)
+
+        border = ttk.Frame(win)
+        border.grid(row=1, column=0, sticky="nsew")
+        border.rowconfigure(0, weight=1)
+        border.columnconfigure(0, weight=1)
+        canvas = tk.Canvas(border, background="black", highlightthickness=0, takefocus=True)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        hscroll = ttk.Scrollbar(border, orient="horizontal", command=canvas.xview)
+        vscroll = ttk.Scrollbar(border, orient="vertical", command=canvas.yview)
+        canvas.configure(xscrollcommand=hscroll.set, yscrollcommand=vscroll.set)
+        self.fullscreen_canvas = canvas
+        self.fullscreen_hscroll = hscroll
+        self.fullscreen_vscroll = vscroll
+        self._bind_canvas(canvas)
+        self._update_scrollbars(canvas)
+        self._set_canvas_placeholder(canvas, self._placeholder_text)
+        win.after(40, lambda: self._redraw_last_frame(reset_view=True))
+        win.after(60, canvas.focus_set)
+
+    def _exit_fullscreen(self) -> None:
+        if self.fullscreen_window is None:
+            return
+        win = self.fullscreen_window
+        self.fullscreen_window = None
+        self.fullscreen_canvas = None
+        self.fullscreen_hscroll = None
+        self.fullscreen_vscroll = None
+        try:
+            win.destroy()
+        except tk.TclError:
+            pass
+        self.after(20, lambda: self._redraw_last_frame(reset_view=True))
+        self.after(30, self.canvas.focus_set)
 
     def _new_token(self) -> None:
         self.host_token.set(secrets.token_urlsafe(9))
@@ -352,7 +377,6 @@ class RemoteControlApp(tk.Tk):
             token = self.host_token.get().strip()
             if not token:
                 raise ValueError("Access token cannot be blank")
-
             self.host_service = RemoteHost(
                 bind="0.0.0.0",
                 port=port,
@@ -360,19 +384,14 @@ class RemoteControlApp(tk.Tk):
                 fps=self.host_fps.get(),
                 jpeg_quality=self.host_quality.get(),
                 frame_queue=self.frame_queue,
-                message_callback=lambda message: self.ui_queue.put(
-                    ("session_message", ("host", message))
-                ),
-                status_callback=lambda message: self.ui_queue.put(
-                    ("host_status", message)
-                ),
+                message_callback=lambda message: self.ui_queue.put(("session_message", ("host", message))),
+                status_callback=lambda message: self.ui_queue.put(("host_status", message)),
             )
             self.host_service.start()
         except Exception as exc:
             messagebox.showerror("Unable to start host", str(exc))
             self.host_service = None
             return
-
         self.start_host_btn.config(state="disabled")
         self.stop_host_btn.config(state="normal")
         self.host_status.set(f"Hosting at {self.host_ip.get()}:{port}")
@@ -382,10 +401,8 @@ class RemoteControlApp(tk.Tk):
         if self.host_service:
             self.host_service.stop()
             self.host_service = None
-
         if self.active_source == "host":
             self._clear_remote_view("Host stopped")
-
         self.start_host_btn.config(state="normal")
         self.stop_host_btn.config(state="disabled")
         self.host_take_control_btn.config(state="disabled")
@@ -398,12 +415,8 @@ class RemoteControlApp(tk.Tk):
         host = self.connect_host.get().strip()
         token = self.connect_token.get().strip()
         if not host or not token:
-            messagebox.showwarning(
-                "Missing connection details",
-                "Enter the host IP/name and access token.",
-            )
+            messagebox.showwarning("Missing connection details", "Enter the host IP/name and access token.")
             return
-
         try:
             port = int(self.connect_port.get())
             self.client_service = RemoteClient(
@@ -413,33 +426,25 @@ class RemoteControlApp(tk.Tk):
                 frame_queue=self.frame_queue,
                 fps=self.host_fps.get(),
                 jpeg_quality=self.host_quality.get(),
-                message_callback=lambda message: self.ui_queue.put(
-                    ("session_message", ("client", message))
-                ),
-                status_callback=lambda message: self.ui_queue.put(
-                    ("client_status", message)
-                ),
+                message_callback=lambda message: self.ui_queue.put(("session_message", ("client", message))),
+                status_callback=lambda message: self.ui_queue.put(("client_status", message)),
             )
             self.client_service.start()
         except Exception as exc:
             messagebox.showerror("Unable to connect", str(exc))
             self.client_service = None
             return
-
         self.connect_btn.config(state="disabled")
         self.disconnect_btn.config(state="normal")
         self.client_status.set("Connecting…")
         self.canvas.focus_set()
 
     def _disconnect(self) -> None:
-        if self.client_service and (
-            self.client_service.running or self.client_service.connected
-        ):
+        if self.client_service and (self.client_service.running or self.client_service.connected):
             self.client_service.stop()
             self.client_service = None
         elif self.host_service and self.host_service.connected:
             self.host_service.disconnect_peer()
-
         self._clear_remote_view("Not connected")
         self.connect_btn.config(state="normal")
         self.disconnect_btn.config(state="disabled")
@@ -473,7 +478,6 @@ class RemoteControlApp(tk.Tk):
             service = self._service_for_source(self.active_source)
             if service and service.connected and service.role == "controller":
                 return service
-
         for source in ("client", "host"):
             service = self._service_for_source(source)
             if service and service.connected and service.role == "controller":
@@ -485,7 +489,6 @@ class RemoteControlApp(tk.Tk):
         try:
             while True:
                 kind, payload = self.ui_queue.get_nowait()
-
                 if kind == "host_status":
                     self.host_status.set(str(payload))
                 elif kind == "client_status":
@@ -500,13 +503,11 @@ class RemoteControlApp(tk.Tk):
                     self._handle_session_message(str(source), message)
         except queue.Empty:
             pass
-
         self.after(30, self._drain_ui_queue)
 
     def _handle_session_message(self, source: str, message: object) -> None:
         if not isinstance(message, dict):
             return
-
         kind = message.get("type")
         if kind == "session_role":
             self._handle_role_event(source, message)
@@ -530,22 +531,18 @@ class RemoteControlApp(tk.Tk):
             except (KeyError, TypeError, ValueError):
                 self.global_status.set("Role switched, but remote geometry is missing")
                 return
-
             self.active_source = source
             self.remote_geometry = RemoteGeometry(width, height)
             self.last_mouse_sent = None
             self._last_frame = None
             self._flush_frames()
             self._show_placeholder("Waiting for first frame…")
-
             direction = f"This computer → {remote_name} ({remote_platform})"
             self.control_direction.set(direction)
             self.client_status.set(
-                f"Controlling {remote_name} • {width}×{height} • "
-                f"{message.get('fps', '?')} fps"
+                f"Controlling {remote_name} • {width}×{height} • {message.get('fps', '?')} fps"
             )
             self.global_status.set(f"Control direction: {direction}")
-
             if source == "host":
                 self.host_role.set(f"This computer is controlling {remote_name}")
                 self.notebook.select(self.control_tab)
@@ -556,18 +553,13 @@ class RemoteControlApp(tk.Tk):
                 self.remote_geometry = None
                 self._last_frame = None
                 self._flush_frames()
-
             direction = f"{remote_name} ({remote_platform}) → this computer"
             self.control_direction.set(direction)
-            self.client_status.set(
-                f"{remote_name} is controlling this computer over the existing connection"
-            )
+            self.client_status.set(f"{remote_name} is controlling this computer over the existing connection")
             self._show_placeholder(
-                "Remote peer is controlling this computer.\n"
-                "Press 'Take control' to reverse the same connection."
+                "Remote peer is controlling this computer.\nPress 'Take control' to reverse the same connection."
             )
             self.global_status.set(f"Control direction: {direction}")
-
             if source == "host":
                 self.host_role.set(f"{remote_name} is controlling this computer")
 
@@ -592,25 +584,13 @@ class RemoteControlApp(tk.Tk):
     def _update_role_controls(self) -> None:
         host_role = self.host_service.role if self.host_service else "disconnected"
         if self.host_service and self.host_service.connected and host_role == "controlled":
-            self.host_take_control_btn.config(
-                state="normal",
-                text="Take control of connected computer",
-            )
+            self.host_take_control_btn.config(state="normal", text="Take control of connected computer")
         elif self.host_service and self.host_service.connected and host_role == "requesting":
-            self.host_take_control_btn.config(
-                state="disabled",
-                text="Requesting control…",
-            )
+            self.host_take_control_btn.config(state="disabled", text="Requesting control…")
         elif self.host_service and self.host_service.connected and host_role == "controller":
-            self.host_take_control_btn.config(
-                state="disabled",
-                text="Controlling connected computer",
-            )
+            self.host_take_control_btn.config(state="disabled", text="Controlling connected computer")
         else:
-            self.host_take_control_btn.config(
-                state="disabled",
-                text="Take control of connected computer",
-            )
+            self.host_take_control_btn.config(state="disabled", text="Take control of connected computer")
 
         controlled_service = None
         for source in ("client", "host"):
@@ -618,17 +598,7 @@ class RemoteControlApp(tk.Tk):
             if service and service.connected and service.role == "controlled":
                 controlled_service = service
                 break
-
-        if controlled_service:
-            self.take_control_btn.config(
-                state="normal",
-                text="Take control",
-            )
-        else:
-            self.take_control_btn.config(
-                state="disabled",
-                text="Take control",
-            )
+        self.take_control_btn.config(state="normal" if controlled_service else "disabled", text="Take control")
 
         if (
             (self.client_service and self.client_service.connected)
@@ -643,10 +613,8 @@ class RemoteControlApp(tk.Tk):
                 latest = self.frame_queue.get_nowait()
         except queue.Empty:
             pass
-
         if latest is not None and self._controller_service():
             self._display_frame(latest)
-
         self.after(15, self._refresh_frame)
 
     def _display_frame(self, jpeg: bytes) -> None:
@@ -657,37 +625,59 @@ class RemoteControlApp(tk.Tk):
         except Exception:
             return
 
-    def _redraw_last_frame(self) -> None:
+    def _redraw_last_frame(self, reset_view: bool = False) -> None:
+        canvas = self._active_canvas()
+        self._update_scrollbars(canvas)
         if self._last_frame is not None:
-            self._draw_image(self._last_frame)
+            self._draw_image(self._last_frame, reset_view=reset_view)
+        else:
+            self._set_canvas_placeholder(canvas, self._placeholder_text)
 
-    def _draw_image(self, image: Image.Image) -> None:
-        cw = max(self.canvas.winfo_width(), 1)
-        ch = max(self.canvas.winfo_height(), 1)
-        ratio = min(cw / image.width, ch / image.height)
-        width = max(1, round(image.width * ratio))
-        height = max(1, round(image.height * ratio))
+    def _draw_image(self, image: Image.Image, *, reset_view: bool = False) -> None:
+        canvas = self._active_canvas()
+        cw = max(canvas.winfo_width(), 1)
+        ch = max(canvas.winfo_height(), 1)
+
+        if self.zoom_mode == "fit":
+            ratio = min(cw / image.width, ch / image.height)
+            width = max(1, round(image.width * ratio))
+            height = max(1, round(image.height * ratio))
+            x = max((cw - width) // 2, 0)
+            y = max((ch - height) // 2, 0)
+            scroll_w = cw
+            scroll_h = ch
+        else:
+            width = max(1, round(image.width * self.zoom_scale))
+            height = max(1, round(image.height * self.zoom_scale))
+            x = max((cw - width) // 2, 0)
+            y = max((ch - height) // 2, 0)
+            scroll_w = max(cw, x + width)
+            scroll_h = max(ch, y + height)
 
         resized = image.resize((width, height), Image.Resampling.BILINEAR)
         self.remote_photo = ImageTk.PhotoImage(resized)
         self.remote_image_size = (width, height)
+        self.remote_image_origin = (x, y)
 
-        x = (cw - width) // 2
-        y = (ch - height) // 2
-        self.canvas.delete("remote_frame")
-        self.canvas.create_image(
-            x,
-            y,
-            anchor="nw",
-            image=self.remote_photo,
-            tags="remote_frame",
-        )
-        self.canvas.itemconfigure("placeholder", state="hidden")
-        self.canvas.tag_lower("remote_frame")
+        canvas.delete("remote_frame")
+        canvas.delete("placeholder")
+        canvas.create_image(x, y, anchor="nw", image=self.remote_photo, tags="remote_frame")
+        canvas.configure(scrollregion=(0, 0, scroll_w, scroll_h))
+        self._update_scrollbars(canvas)
+        if reset_view:
+            canvas.xview_moveto(0)
+            canvas.yview_moveto(0)
+        canvas.focus_set()
+
+    def _set_canvas_placeholder(self, canvas: tk.Canvas, text: str) -> None:
+        canvas.delete("remote_frame")
+        canvas.delete("placeholder")
+        canvas.create_text(20, 20, anchor="nw", fill="white", text=text, tags="placeholder")
+        canvas.configure(scrollregion=(0, 0, max(canvas.winfo_width(), 1), max(canvas.winfo_height(), 1)))
 
     def _show_placeholder(self, text: str) -> None:
-        self.canvas.delete("remote_frame")
-        self.canvas.itemconfigure("placeholder", text=text, state="normal")
+        self._placeholder_text = text
+        self._set_canvas_placeholder(self._active_canvas(), text)
 
     def _clear_remote_view(self, text: str) -> None:
         self.active_source = None
@@ -705,20 +695,15 @@ class RemoteControlApp(tk.Tk):
             pass
 
     def _view_coordinates(self, event: tk.Event) -> tuple[int, int] | None:
-        if not self.remote_geometry:
+        if not self.remote_geometry or not isinstance(event.widget, tk.Canvas):
             return None
-
-        cw = max(self.canvas.winfo_width(), 1)
-        ch = max(self.canvas.winfo_height(), 1)
+        canvas = event.widget
         iw, ih = self.remote_image_size
-        ox = (cw - iw) // 2
-        oy = (ch - ih) // 2
-
-        x = int(event.x) - ox
-        y = int(event.y) - oy
+        ox, oy = self.remote_image_origin
+        x = int(canvas.canvasx(event.x)) - ox
+        y = int(canvas.canvasy(event.y)) - oy
         if x < 0 or y < 0 or x >= iw or y >= ih:
             return None
-
         return self.remote_geometry.map_from_view(x, y, iw, ih)
 
     def _mouse_move(self, event: tk.Event) -> None:
@@ -728,23 +713,13 @@ class RemoteControlApp(tk.Tk):
             self.last_mouse_sent = coords
             service.send("mouse_move", x=coords[0], y=coords[1])
 
-    def _mouse_button(
-        self,
-        event: tk.Event,
-        button: str,
-        down: bool,
-    ) -> None:
-        self.canvas.focus_set()
+    def _mouse_button(self, event: tk.Event, button: str, down: bool) -> None:
+        if isinstance(event.widget, tk.Canvas):
+            event.widget.focus_set()
         service = self._controller_service()
         coords = self._view_coordinates(event)
         if coords and service:
-            service.send(
-                "mouse_button",
-                button=button,
-                down=down,
-                x=coords[0],
-                y=coords[1],
-            )
+            service.send("mouse_button", button=button, down=down, x=coords[0], y=coords[1])
 
     def _mouse_wheel(self, event: tk.Event) -> None:
         amount = 1 if event.delta > 0 else -1
@@ -777,12 +752,10 @@ class RemoteControlApp(tk.Tk):
         service = self._controller_service()
         if not service:
             return
-
         try:
             text = self.clipboard_get()
         except tk.TclError:
             text = ""
-
         service.send("clipboard_set", text=text)
         self.global_status.set("Local clipboard sent to remote")
 
@@ -793,6 +766,7 @@ class RemoteControlApp(tk.Tk):
 
     def _on_close(self) -> None:
         try:
+            self._exit_fullscreen()
             if self.client_service:
                 self.client_service.stop()
             if self.host_service:
