@@ -85,6 +85,14 @@ class RemoteClient:
             self._send_wakeup.set()
             return
 
+        # Tk emits a motion event immediately before a button event. Motion is
+        # deliberately coalesced, so copy that newest coordinate into the reliable
+        # click packet; the host can move and click atomically at the right point.
+        if message_type == "mouse_button" and self._latest_mouse is not None:
+            payload = dict(payload)
+            payload.setdefault("x", self._latest_mouse[0])
+            payload.setdefault("y", self._latest_mouse[1])
+
         raw = encode_message(message_type, **payload)
         try:
             self._send_queue.put_nowait(raw)
