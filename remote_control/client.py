@@ -62,7 +62,25 @@ class RemoteClient:
         if not self._loop or not self._send_queue or not self.running:
             return
         raw = encode_message(message_type, **payload)
-        self._loop.call_soon_threadsafe(self._send_queue.put_nowait, raw)
+        self._loop.call_soon_threadsafe(self._queue_outbound, raw)
+
+    def _queue_outbound(self, raw: str) -> None:
+        """Queue a control message without ever blocking the Tk thread.
+
+        If the queue is saturated by mouse motion, discard the oldest queued event
+        rather than allowing input latency to grow without bound.
+        """
+        if self._send_queue is None:
+            return
+        if self._send_queue.full():
+            try:
+                self._send_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+        try:
+            self._send_queue.put_nowait(raw)
+        except asyncio.QueueFull:
+            pass
 
     def _thread_main(self) -> None:
         try:
@@ -74,7 +92,7 @@ class RemoteClient:
 
     async def _run(self) -> None:
         self._loop = asyncio.get_running_loop()
-        self._send_queue = asyncio.Queue(maxsize=1000)
+        self._send_queue = asyncio.Queue(maxsize=250)
         self._stop_event = asyncio.Event()
         uri = f"ws://{self.host}:{self.port}"
         self.status_callback(f"Connecting to {uri}")
@@ -99,6 +117,11 @@ class RemoteClient:
                 done, pending = await asyncio.wait({receiver, sender, stopper}, return_when=asyncio.FIRST_COMPLETED)
                 for task in pending:
                     task.cancel()
+                for task in pending:
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
                 for task in done:
                     if not task.cancelled():
                         exc = task.exception()
@@ -117,7 +140,10 @@ class RemoteClient:
                         self.frame_queue.get_nowait()
                     except queue.Empty:
                         pass
-                self.frame_queue.put_nowait(raw)
+                try:
+                    self.frame_queue.put_nowait(raw)
+                except queue.Full:
+                    pass
             else:
                 self.message_callback(decode_message(raw))
 
@@ -126,3 +152,7 @@ class RemoteClient:
         while True:
             raw = await self._send_queue.get()
             await websocket.send(raw)
+            # websocket.send() may complete synchronously while buffers have space.
+            # Yield explicitly so the frame receiver remains responsive even during
+            # continuous mouse motion or rapid key input.
+            await asyncio.sleep(0)
