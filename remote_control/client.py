@@ -2,46 +2,70 @@ from __future__ import annotations
 
 import asyncio
 import queue
+import socket
 import threading
 from collections.abc import Callable
+from typing import Any
 
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed
 
+from .peer import MessageCallback, PeerSession
+from .platform_io import platform_name
 from .protocol import ProtocolError, decode_message, encode_message
 
 StatusCallback = Callable[[str], None]
-MessageCallback = Callable[[dict], None]
 
 
 class RemoteClient:
+    """Create the outbound connection to a listening peer.
+
+    This is ideal for a locked-down office PC: it only needs to establish the
+    outbound WebSocket once. Control can then switch in either direction without
+    opening an inbound port on this computer.
+    """
+
     def __init__(
         self,
         host: str,
         port: int,
         token: str,
         frame_queue: queue.Queue[bytes],
+        fps: int = 20,
+        jpeg_quality: int = 50,
+        max_width: int = 1280,
         message_callback: MessageCallback | None = None,
         status_callback: StatusCallback | None = None,
     ) -> None:
         self.host = host.strip()
-        self.port = port
+        self.port = int(port)
         self.token = token
         self.frame_queue = frame_queue
+        self.fps = max(2, min(int(fps), 30))
+        self.jpeg_quality = max(25, min(int(jpeg_quality), 90))
+        self.max_width = max(640, int(max_width))
         self.message_callback = message_callback or (lambda _message: None)
         self.status_callback = status_callback or (lambda _message: None)
+
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._send_queue: asyncio.Queue[str] | None = None
-        self._send_wakeup: asyncio.Event | None = None
-        self._latest_mouse: tuple[int, int] | None = None
-        self._stop_event: asyncio.Event | None = None
         self._started = threading.Event()
         self._error: Exception | None = None
+        self._session: PeerSession | None = None
 
     @property
     def running(self) -> bool:
         return bool(self._thread and self._thread.is_alive())
+
+    @property
+    def connected(self) -> bool:
+        return bool(self._session and self._session.connected)
+
+    @property
+    def role(self) -> str:
+        if not self._session:
+            return "disconnected"
+        return self._session.role
 
     def start(self) -> None:
         if self.running:
@@ -59,53 +83,22 @@ class RemoteClient:
             raise self._error
 
     def stop(self) -> None:
-        if self._loop and self._stop_event:
-            self._loop.call_soon_threadsafe(self._stop_event.set)
+        session = self._session
+        if session:
+            session.close_threadsafe()
+
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=3)
 
-    def send(self, message_type: str, **payload) -> None:
-        if not self._loop or not self.running:
-            return
-        self._loop.call_soon_threadsafe(
-            self._queue_outbound,
-            message_type,
-            payload,
-        )
+    def send(self, message_type: str, **payload: Any) -> None:
+        session = self._session
+        if session:
+            session.send_threadsafe(message_type, **payload)
 
-    def _queue_outbound(self, message_type: str, payload: dict) -> None:
-        if self._send_queue is None or self._send_wakeup is None:
-            return
-
-        if message_type == "mouse_move":
-            self._latest_mouse = (
-                int(payload.get("x", 0)),
-                int(payload.get("y", 0)),
-            )
-            self._send_wakeup.set()
-            return
-
-        # Tk emits a motion event immediately before a button event. Motion is
-        # deliberately coalesced, so copy that newest coordinate into the reliable
-        # click packet; the host can move and click atomically at the right point.
-        if message_type == "mouse_button" and self._latest_mouse is not None:
-            payload = dict(payload)
-            payload.setdefault("x", self._latest_mouse[0])
-            payload.setdefault("y", self._latest_mouse[1])
-
-        raw = encode_message(message_type, **payload)
-        try:
-            self._send_queue.put_nowait(raw)
-        except asyncio.QueueFull:
-            try:
-                self._send_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                pass
-            try:
-                self._send_queue.put_nowait(raw)
-            except asyncio.QueueFull:
-                pass
-        self._send_wakeup.set()
+    def request_control(self) -> None:
+        session = self._session
+        if session:
+            session.request_control_threadsafe()
 
     def _thread_main(self) -> None:
         try:
@@ -117,11 +110,6 @@ class RemoteClient:
 
     async def _run(self) -> None:
         self._loop = asyncio.get_running_loop()
-        self._send_queue = asyncio.Queue(maxsize=256)
-        self._send_wakeup = asyncio.Event()
-        self._latest_mouse = None
-        self._stop_event = asyncio.Event()
-
         uri = f"ws://{self.host}:{self.port}"
         self.status_callback(f"Connecting to {uri}")
         self._started.set()
@@ -130,11 +118,20 @@ class RemoteClient:
             async with connect(
                 uri,
                 max_size=8 * 1024 * 1024,
-                max_queue=2,
+                max_queue=4,
                 open_timeout=5,
                 compression=None,
             ) as websocket:
-                await websocket.send(encode_message("auth", token=self.token))
+                await websocket.send(
+                    encode_message(
+                        "auth",
+                        token=self.token,
+                        platform=platform_name(),
+                        name=socket.gethostname(),
+                        supports_role_switch=True,
+                    )
+                )
+
                 first = await asyncio.wait_for(websocket.recv(), timeout=5)
                 if not isinstance(first, str):
                     raise ProtocolError("Expected server hello")
@@ -147,74 +144,32 @@ class RemoteClient:
                 if hello.get("type") != "hello" or not hello.get("ok"):
                     raise ProtocolError("Unexpected server response")
 
-                self.message_callback(hello)
-                self.status_callback(f"Connected to {self.host}:{self.port}")
-
-                receiver = asyncio.create_task(self._receiver(websocket))
-                sender = asyncio.create_task(self._sender(websocket))
-                stopper = asyncio.create_task(self._stop_event.wait())
-                done, pending = await asyncio.wait(
-                    {receiver, sender, stopper},
-                    return_when=asyncio.FIRST_COMPLETED,
+                session = PeerSession(
+                    websocket,
+                    initial_role="controller",
+                    fps=self.fps,
+                    jpeg_quality=self.jpeg_quality,
+                    max_width=self.max_width,
+                    frame_queue=self.frame_queue,
+                    remote_info={
+                        key: hello[key]
+                        for key in ("platform", "name")
+                        if key in hello
+                    },
+                    message_callback=self.message_callback,
+                    status_callback=self.status_callback,
                 )
+                self._session = session
+                session.start_initial_controller(hello)
+                self.status_callback(f"Connected to {self.host}:{self.port}")
+                await session.run()
 
-                for task in pending:
-                    task.cancel()
-                for task in pending:
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
-                for task in done:
-                    if not task.cancelled():
-                        exc = task.exception()
-                        if exc and not isinstance(exc, ConnectionClosed):
-                            raise exc
         except ConnectionClosed:
             pass
         finally:
+            session = self._session
+            if session:
+                await session.close(close_socket=False)
+            self._session = None
+            self.message_callback({"type": "session_role", "role": "disconnected"})
             self.status_callback("Disconnected")
-
-    async def _receiver(self, websocket) -> None:
-        async for raw in websocket:
-            if isinstance(raw, bytes):
-                if self.frame_queue.full():
-                    try:
-                        self.frame_queue.get_nowait()
-                    except queue.Empty:
-                        pass
-                try:
-                    self.frame_queue.put_nowait(raw)
-                except queue.Full:
-                    pass
-            else:
-                self.message_callback(decode_message(raw))
-
-    async def _sender(self, websocket) -> None:
-        assert self._send_queue is not None
-        assert self._send_wakeup is not None
-
-        mouse_period = 1.0 / 60.0
-
-        while True:
-            try:
-                raw = self._send_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                raw = None
-
-            if raw is not None:
-                await websocket.send(raw)
-                await asyncio.sleep(0)
-                continue
-
-            if self._latest_mouse is not None:
-                x, y = self._latest_mouse
-                self._latest_mouse = None
-                await websocket.send(encode_message("mouse_move", x=x, y=y))
-                await asyncio.sleep(mouse_period)
-                continue
-
-            self._send_wakeup.clear()
-            if not self._send_queue.empty() or self._latest_mouse is not None:
-                continue
-            await self._send_wakeup.wait()
