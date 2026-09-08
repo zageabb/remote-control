@@ -33,6 +33,8 @@ class RemoteClient:
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._send_queue: asyncio.Queue[str] | None = None
+        self._send_wakeup: asyncio.Event | None = None
+        self._latest_mouse: tuple[int, int] | None = None
         self._stop_event: asyncio.Event | None = None
         self._started = threading.Event()
         self._error: Exception | None = None
@@ -46,7 +48,11 @@ class RemoteClient:
             return
         self._error = None
         self._started.clear()
-        self._thread = threading.Thread(target=self._thread_main, name="remote-client", daemon=True)
+        self._thread = threading.Thread(
+            target=self._thread_main,
+            name="remote-client",
+            daemon=True,
+        )
         self._thread.start()
         self._started.wait(timeout=2)
         if self._error:
@@ -59,28 +65,39 @@ class RemoteClient:
             self._thread.join(timeout=3)
 
     def send(self, message_type: str, **payload) -> None:
-        if not self._loop or not self._send_queue or not self.running:
+        if not self._loop or not self.running:
             return
+        self._loop.call_soon_threadsafe(
+            self._queue_outbound,
+            message_type,
+            payload,
+        )
+
+    def _queue_outbound(self, message_type: str, payload: dict) -> None:
+        if self._send_queue is None or self._send_wakeup is None:
+            return
+
+        if message_type == "mouse_move":
+            self._latest_mouse = (
+                int(payload.get("x", 0)),
+                int(payload.get("y", 0)),
+            )
+            self._send_wakeup.set()
+            return
+
         raw = encode_message(message_type, **payload)
-        self._loop.call_soon_threadsafe(self._queue_outbound, raw)
-
-    def _queue_outbound(self, raw: str) -> None:
-        """Queue a control message without ever blocking the Tk thread.
-
-        If the queue is saturated by mouse motion, discard the oldest queued event
-        rather than allowing input latency to grow without bound.
-        """
-        if self._send_queue is None:
-            return
-        if self._send_queue.full():
+        try:
+            self._send_queue.put_nowait(raw)
+        except asyncio.QueueFull:
             try:
                 self._send_queue.get_nowait()
             except asyncio.QueueEmpty:
                 pass
-        try:
-            self._send_queue.put_nowait(raw)
-        except asyncio.QueueFull:
-            pass
+            try:
+                self._send_queue.put_nowait(raw)
+            except asyncio.QueueFull:
+                pass
+        self._send_wakeup.set()
 
     def _thread_main(self) -> None:
         try:
@@ -92,29 +109,47 @@ class RemoteClient:
 
     async def _run(self) -> None:
         self._loop = asyncio.get_running_loop()
-        self._send_queue = asyncio.Queue(maxsize=250)
+        self._send_queue = asyncio.Queue(maxsize=256)
+        self._send_wakeup = asyncio.Event()
+        self._latest_mouse = None
         self._stop_event = asyncio.Event()
+
         uri = f"ws://{self.host}:{self.port}"
         self.status_callback(f"Connecting to {uri}")
         self._started.set()
+
         try:
-            async with connect(uri, max_size=8 * 1024 * 1024, open_timeout=5) as websocket:
+            async with connect(
+                uri,
+                max_size=8 * 1024 * 1024,
+                max_queue=2,
+                open_timeout=5,
+                compression=None,
+            ) as websocket:
                 await websocket.send(encode_message("auth", token=self.token))
                 first = await asyncio.wait_for(websocket.recv(), timeout=5)
                 if not isinstance(first, str):
                     raise ProtocolError("Expected server hello")
+
                 hello = decode_message(first)
                 if hello.get("type") == "auth_result" and not hello.get("ok"):
-                    raise PermissionError(str(hello.get("message", "Authentication failed")))
+                    raise PermissionError(
+                        str(hello.get("message", "Authentication failed"))
+                    )
                 if hello.get("type") != "hello" or not hello.get("ok"):
                     raise ProtocolError("Unexpected server response")
+
                 self.message_callback(hello)
                 self.status_callback(f"Connected to {self.host}:{self.port}")
 
                 receiver = asyncio.create_task(self._receiver(websocket))
                 sender = asyncio.create_task(self._sender(websocket))
                 stopper = asyncio.create_task(self._stop_event.wait())
-                done, pending = await asyncio.wait({receiver, sender, stopper}, return_when=asyncio.FIRST_COMPLETED)
+                done, pending = await asyncio.wait(
+                    {receiver, sender, stopper},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+
                 for task in pending:
                     task.cancel()
                 for task in pending:
@@ -149,10 +184,29 @@ class RemoteClient:
 
     async def _sender(self, websocket) -> None:
         assert self._send_queue is not None
+        assert self._send_wakeup is not None
+
+        mouse_period = 1.0 / 60.0
+
         while True:
-            raw = await self._send_queue.get()
-            await websocket.send(raw)
-            # websocket.send() may complete synchronously while buffers have space.
-            # Yield explicitly so the frame receiver remains responsive even during
-            # continuous mouse motion or rapid key input.
-            await asyncio.sleep(0)
+            try:
+                raw = self._send_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                raw = None
+
+            if raw is not None:
+                await websocket.send(raw)
+                await asyncio.sleep(0)
+                continue
+
+            if self._latest_mouse is not None:
+                x, y = self._latest_mouse
+                self._latest_mouse = None
+                await websocket.send(encode_message("mouse_move", x=x, y=y))
+                await asyncio.sleep(mouse_period)
+                continue
+
+            self._send_wakeup.clear()
+            if not self._send_queue.empty() or self._latest_mouse is not None:
+                continue
+            await self._send_wakeup.wait()
