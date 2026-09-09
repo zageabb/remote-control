@@ -16,13 +16,18 @@ from .protocol import ProtocolError, decode_message, encode_message
 
 StatusCallback = Callable[[str], None]
 
+KEEPALIVE_INTERVAL = 15
+KEEPALIVE_TIMEOUT = 60
+RECONNECT_DELAYS = (1, 2, 5, 10, 15)
+
 
 class RemoteClient:
-    """Create the outbound connection to a listening peer.
+    """Create and maintain the outbound peer connection.
 
-    This is ideal for a locked-down office PC: it only needs to establish the
-    outbound WebSocket once. Control can then switch in either direction without
-    opening an inbound port on this computer.
+    This is intentionally resilient for locked-down office PCs. The Windows side
+    can establish one outbound WebSocket and, if Wi-Fi or a corporate network
+    briefly interrupts it, reconnect automatically without requiring an inbound
+    Windows firewall rule.
     """
 
     def __init__(
@@ -49,6 +54,7 @@ class RemoteClient:
 
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._stop_event: asyncio.Event | None = None
         self._started = threading.Event()
         self._error: Exception | None = None
         self._session: PeerSession | None = None
@@ -83,6 +89,11 @@ class RemoteClient:
             raise self._error
 
     def stop(self) -> None:
+        loop = self._loop
+        stop_event = self._stop_event
+        if loop and stop_event:
+            loop.call_soon_threadsafe(stop_event.set)
+
         session = self._session
         if session:
             session.close_threadsafe()
@@ -110,66 +121,150 @@ class RemoteClient:
 
     async def _run(self) -> None:
         self._loop = asyncio.get_running_loop()
+        self._stop_event = asyncio.Event()
         uri = f"ws://{self.host}:{self.port}"
         self.status_callback(f"Connecting to {uri}")
         self._started.set()
 
+        reconnect_index = 0
+        ever_connected = False
+
         try:
-            async with connect(
-                uri,
-                max_size=8 * 1024 * 1024,
-                max_queue=4,
-                open_timeout=5,
-                compression=None,
-            ) as websocket:
-                await websocket.send(
-                    encode_message(
-                        "auth",
-                        token=self.token,
-                        platform=platform_name(),
-                        name=socket.gethostname(),
-                        supports_role_switch=True,
+            while not self._stop_event.is_set():
+                session: PeerSession | None = None
+                try:
+                    async with connect(
+                        uri,
+                        max_size=8 * 1024 * 1024,
+                        max_queue=4,
+                        open_timeout=8,
+                        close_timeout=5,
+                        ping_interval=KEEPALIVE_INTERVAL,
+                        ping_timeout=KEEPALIVE_TIMEOUT,
+                        compression=None,
+                    ) as websocket:
+                        await websocket.send(
+                            encode_message(
+                                "auth",
+                                token=self.token,
+                                platform=platform_name(),
+                                name=socket.gethostname(),
+                                supports_role_switch=True,
+                            )
+                        )
+
+                        first = await asyncio.wait_for(websocket.recv(), timeout=8)
+                        if not isinstance(first, str):
+                            raise ProtocolError("Expected server hello")
+
+                        hello = decode_message(first)
+                        if hello.get("type") == "auth_result" and not hello.get("ok"):
+                            raise PermissionError(
+                                str(hello.get("message", "Authentication failed"))
+                            )
+                        if hello.get("type") != "hello" or not hello.get("ok"):
+                            raise ProtocolError("Unexpected server response")
+
+                        session = PeerSession(
+                            websocket,
+                            initial_role="controller",
+                            fps=self.fps,
+                            jpeg_quality=self.jpeg_quality,
+                            max_width=self.max_width,
+                            frame_queue=self.frame_queue,
+                            remote_info={
+                                key: hello[key]
+                                for key in ("platform", "name")
+                                if key in hello
+                            },
+                            message_callback=self.message_callback,
+                            status_callback=self.status_callback,
+                        )
+                        self._session = session
+                        session.start_initial_controller(hello)
+
+                        if ever_connected:
+                            self.status_callback(
+                                f"Reconnected to {self.host}:{self.port}"
+                            )
+                        else:
+                            self.status_callback(
+                                f"Connected to {self.host}:{self.port}"
+                            )
+                        ever_connected = True
+                        reconnect_index = 0
+
+                        await session.run()
+
+                except (PermissionError, ProtocolError):
+                    # Authentication/protocol errors won't improve by retrying.
+                    raise
+                except (ConnectionClosed, OSError, asyncio.TimeoutError) as exc:
+                    if self._stop_event.is_set():
+                        break
+                    reason = self._connection_reason(exc)
+                    delay = RECONNECT_DELAYS[
+                        min(reconnect_index, len(RECONNECT_DELAYS) - 1)
+                    ]
+                    reconnect_index += 1
+                    self.status_callback(
+                        f"Connection interrupted ({reason}). Reconnecting in {delay}s…"
                     )
-                )
-
-                first = await asyncio.wait_for(websocket.recv(), timeout=5)
-                if not isinstance(first, str):
-                    raise ProtocolError("Expected server hello")
-
-                hello = decode_message(first)
-                if hello.get("type") == "auth_result" and not hello.get("ok"):
-                    raise PermissionError(
-                        str(hello.get("message", "Authentication failed"))
+                    self.message_callback(
+                        {
+                            "type": "session_role",
+                            "role": "reconnecting",
+                            "retry_seconds": delay,
+                        }
                     )
-                if hello.get("type") != "hello" or not hello.get("ok"):
-                    raise ProtocolError("Unexpected server response")
+                    if await self._wait_or_stop(delay):
+                        break
+                finally:
+                    if session:
+                        await session.close(close_socket=False)
+                    if self._session is session:
+                        self._session = None
 
-                session = PeerSession(
-                    websocket,
-                    initial_role="controller",
-                    fps=self.fps,
-                    jpeg_quality=self.jpeg_quality,
-                    max_width=self.max_width,
-                    frame_queue=self.frame_queue,
-                    remote_info={
-                        key: hello[key]
-                        for key in ("platform", "name")
-                        if key in hello
-                    },
-                    message_callback=self.message_callback,
-                    status_callback=self.status_callback,
-                )
-                self._session = session
-                session.start_initial_controller(hello)
-                self.status_callback(f"Connected to {self.host}:{self.port}")
-                await session.run()
-
-        except ConnectionClosed:
-            pass
+                # session.run() can return cleanly when the network disappears or
+                # the peer closes. Retry unless the user explicitly disconnected.
+                if (
+                    not self._stop_event.is_set()
+                    and self._session is None
+                    and reconnect_index == 0
+                ):
+                    delay = RECONNECT_DELAYS[0]
+                    reconnect_index = 1
+                    self.status_callback(
+                        f"Connection ended. Reconnecting in {delay}s…"
+                    )
+                    self.message_callback(
+                        {
+                            "type": "session_role",
+                            "role": "reconnecting",
+                            "retry_seconds": delay,
+                        }
+                    )
+                    if await self._wait_or_stop(delay):
+                        break
         finally:
-            session = self._session
-            if session:
-                await session.close(close_socket=False)
             self._session = None
             self.message_callback({"type": "session_role", "role": "disconnected"})
             self.status_callback("Disconnected")
+
+    async def _wait_or_stop(self, seconds: float) -> bool:
+        assert self._stop_event is not None
+        try:
+            await asyncio.wait_for(self._stop_event.wait(), timeout=seconds)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+    @staticmethod
+    def _connection_reason(exc: BaseException) -> str:
+        if isinstance(exc, ConnectionClosed):
+            code = getattr(exc, "code", None)
+            reason = getattr(exc, "reason", "")
+            if code is not None:
+                return f"WebSocket {code}{': ' + reason if reason else ''}"
+        text = str(exc).strip()
+        return text or exc.__class__.__name__
