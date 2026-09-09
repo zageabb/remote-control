@@ -23,7 +23,10 @@ class RemoteHost:
     """Listen for one outbound peer connection.
 
     The socket remains server-side for the entire session, but control can switch
-    direction repeatedly over that same full-duplex WebSocket.
+    direction repeatedly over that same full-duplex WebSocket. A newly
+    authenticated connection replaces a stale prior session, which is important
+    when the outbound office PC reconnects before TCP keepalive has declared the
+    old socket dead.
     """
 
     def __init__(
@@ -54,6 +57,7 @@ class RemoteHost:
         self._started = threading.Event()
         self._error: Exception | None = None
         self._session: PeerSession | None = None
+        self._session_lock: asyncio.Lock | None = None
 
     @property
     def running(self) -> bool:
@@ -121,6 +125,7 @@ class RemoteHost:
     async def _run(self) -> None:
         self._loop = asyncio.get_running_loop()
         self._stop_event = asyncio.Event()
+        self._session_lock = asyncio.Lock()
 
         async with serve(
             self._handle_client,
@@ -141,11 +146,6 @@ class RemoteHost:
 
     async def _handle_client(self, websocket: ServerConnection) -> None:
         peer = websocket.remote_address
-
-        if self._session and self._session.connected:
-            await websocket.close(code=4009, reason="Another peer is already connected")
-            return
-
         self.status_callback(f"Connection from {peer}")
         session: PeerSession | None = None
 
@@ -172,18 +172,29 @@ class RemoteHost:
                 if key in auth
             }
 
-            session = PeerSession(
-                websocket,
-                initial_role="controlled",
-                fps=self.fps,
-                jpeg_quality=self.jpeg_quality,
-                max_width=self.max_width,
-                frame_queue=self.frame_queue,
-                remote_info=remote_info,
-                message_callback=self.message_callback,
-                status_callback=self.status_callback,
-            )
-            self._session = session
+            assert self._session_lock is not None
+            async with self._session_lock:
+                previous = self._session
+                if previous and previous.connected:
+                    self.status_callback(
+                        "Authenticated reconnect received; replacing previous peer session"
+                    )
+                    await previous.close(close_socket=True)
+                    if self._session is previous:
+                        self._session = None
+
+                session = PeerSession(
+                    websocket,
+                    initial_role="controlled",
+                    fps=self.fps,
+                    jpeg_quality=self.jpeg_quality,
+                    max_width=self.max_width,
+                    frame_queue=self.frame_queue,
+                    remote_info=remote_info,
+                    message_callback=self.message_callback,
+                    status_callback=self.status_callback,
+                )
+                self._session = session
 
             await session.start_initial_controlled()
             self.status_callback(f"Peer connected: {peer}")
@@ -203,5 +214,7 @@ class RemoteHost:
                 await session.close(close_socket=False)
             if self._session is session:
                 self._session = None
-            self.message_callback({"type": "session_role", "role": "disconnected"})
-            self.status_callback(f"Peer disconnected: {peer}")
+                self.message_callback(
+                    {"type": "session_role", "role": "disconnected"}
+                )
+                self.status_callback(f"Peer disconnected: {peer}")
