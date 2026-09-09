@@ -17,6 +17,8 @@ pyautogui.FAILSAFE = False
 _IS_WINDOWS = platform.system() == "Windows"
 
 if _IS_WINDOWS:
+    from ctypes import wintypes
+
     _user32 = ctypes.windll.user32
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(2)
@@ -25,6 +27,48 @@ if _IS_WINDOWS:
             _user32.SetProcessDPIAware()
         except Exception:
             pass
+
+    _ULONG_PTR = ctypes.c_ulonglong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_ulong
+
+    class _MOUSEINPUT(ctypes.Structure):
+        _fields_ = [
+            ("dx", wintypes.LONG),
+            ("dy", wintypes.LONG),
+            ("mouseData", wintypes.DWORD),
+            ("dwFlags", wintypes.DWORD),
+            ("time", wintypes.DWORD),
+            ("dwExtraInfo", _ULONG_PTR),
+        ]
+
+    class _KEYBDINPUT(ctypes.Structure):
+        _fields_ = [
+            ("wVk", wintypes.WORD),
+            ("wScan", wintypes.WORD),
+            ("dwFlags", wintypes.DWORD),
+            ("time", wintypes.DWORD),
+            ("dwExtraInfo", _ULONG_PTR),
+        ]
+
+    class _HARDWAREINPUT(ctypes.Structure):
+        _fields_ = [
+            ("uMsg", wintypes.DWORD),
+            ("wParamL", wintypes.WORD),
+            ("wParamH", wintypes.WORD),
+        ]
+
+    class _INPUTUNION(ctypes.Union):
+        _fields_ = [
+            ("mi", _MOUSEINPUT),
+            ("ki", _KEYBDINPUT),
+            ("hi", _HARDWAREINPUT),
+        ]
+
+    class _INPUT(ctypes.Structure):
+        _anonymous_ = ("union",)
+        _fields_ = [
+            ("type", wintypes.DWORD),
+            ("union", _INPUTUNION),
+        ]
 
     _user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
     _user32.SetCursorPos.restype = ctypes.c_bool
@@ -37,6 +81,18 @@ if _IS_WINDOWS:
     ]
     _user32.VkKeyScanW.argtypes = [ctypes.c_wchar]
     _user32.VkKeyScanW.restype = ctypes.c_short
+    _user32.keybd_event.argtypes = [
+        wintypes.BYTE,
+        wintypes.BYTE,
+        wintypes.DWORD,
+        _ULONG_PTR,
+    ]
+    _user32.SendInput.argtypes = [
+        wintypes.UINT,
+        ctypes.POINTER(_INPUT),
+        ctypes.c_int,
+    ]
+    _user32.SendInput.restype = wintypes.UINT
 
     _MOUSE_FLAGS = {
         ("left", True): 0x0002,
@@ -48,8 +104,12 @@ if _IS_WINDOWS:
     }
     _MOUSEEVENTF_WHEEL = 0x0800
     _WHEEL_DELTA = 120
+
+    _INPUT_KEYBOARD = 1
     _KEYEVENTF_EXTENDEDKEY = 0x0001
     _KEYEVENTF_KEYUP = 0x0002
+    _KEYEVENTF_UNICODE = 0x0004
+
     _VK = {
         "backspace": 0x08,
         "tab": 0x09,
@@ -73,10 +133,26 @@ if _IS_WINDOWS:
     }
     for _n in range(1, 25):
         _VK[f"f{_n}"] = 0x6F + _n
+
     _EXTENDED_KEYS = {
-        "pageup", "pagedown", "end", "home", "left", "up",
-        "right", "down", "delete", "win", "command",
+        "pageup",
+        "pagedown",
+        "end",
+        "home",
+        "left",
+        "up",
+        "right",
+        "down",
+        "delete",
+        "win",
+        "command",
     }
+
+    # Printable characters are normally injected as Unicode. If one of these
+    # shortcut modifiers is held, character keys remain virtual-key events so
+    # combinations such as Ctrl+C / Alt+F continue to work normally.
+    _SHORTCUT_MODIFIERS = {"ctrl", "alt", "win", "command"}
+    _WIN_MODIFIERS_DOWN: set[str] = set()
 
 
 @dataclass(slots=True)
@@ -208,8 +284,57 @@ def _windows_virtual_key(key: str) -> tuple[int, bool] | None:
     return None
 
 
+def _windows_send_unicode(text: str) -> bool:
+    """Inject Unicode text with SendInput, independent of keyboard layout."""
+    if not text:
+        return True
+
+    units = text.encode("utf-16-le")
+    for offset in range(0, len(units), 2):
+        scan = units[offset] | (units[offset + 1] << 8)
+        inputs = (_INPUT * 2)()
+        inputs[0].type = _INPUT_KEYBOARD
+        inputs[0].ki = _KEYBDINPUT(
+            0,
+            scan,
+            _KEYEVENTF_UNICODE,
+            0,
+            0,
+        )
+        inputs[1].type = _INPUT_KEYBOARD
+        inputs[1].ki = _KEYBDINPUT(
+            0,
+            scan,
+            _KEYEVENTF_UNICODE | _KEYEVENTF_KEYUP,
+            0,
+            0,
+        )
+        if int(_user32.SendInput(2, inputs, ctypes.sizeof(_INPUT))) != 2:
+            return False
+    return True
+
+
 def key_event(key: str, down: bool) -> None:
     if _IS_WINDOWS:
+        name = key.lower()
+
+        if name in _SHORTCUT_MODIFIERS:
+            if down:
+                _WIN_MODIFIERS_DOWN.add(name)
+            else:
+                _WIN_MODIFIERS_DOWN.discard(name)
+
+        # For ordinary typing, inject the actual Unicode character instead of
+        # relying on the Windows keyboard layout to reinterpret a Mac key event.
+        # The matching key-up is intentionally ignored because SendInput emits
+        # both Unicode down and up together above.
+        if len(key) == 1 and not (_WIN_MODIFIERS_DOWN & _SHORTCUT_MODIFIERS):
+            if down:
+                if _windows_send_unicode(key):
+                    return
+            else:
+                return
+
         resolved = _windows_virtual_key(key)
         if resolved is not None:
             vk, extended = resolved
