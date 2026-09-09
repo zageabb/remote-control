@@ -15,6 +15,9 @@ from .protocol import ProtocolError, decode_message, encode_message
 
 StatusCallback = Callable[[str], None]
 
+KEEPALIVE_INTERVAL = 15
+KEEPALIVE_TIMEOUT = 60
+
 
 class RemoteHost:
     """Listen for one outbound peer connection.
@@ -125,6 +128,9 @@ class RemoteHost:
             self.port,
             max_size=8 * 1024 * 1024,
             max_queue=64,
+            close_timeout=5,
+            ping_interval=KEEPALIVE_INTERVAL,
+            ping_timeout=KEEPALIVE_TIMEOUT,
             compression=None,
         ):
             self.status_callback(f"Hosting on {self.bind}:{self.port}")
@@ -144,7 +150,7 @@ class RemoteHost:
         session: PeerSession | None = None
 
         try:
-            raw = await asyncio.wait_for(websocket.recv(), timeout=5)
+            raw = await asyncio.wait_for(websocket.recv(), timeout=8)
             if not isinstance(raw, str):
                 await websocket.close(code=4001, reason="Authentication required")
                 return
