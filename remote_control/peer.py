@@ -13,6 +13,7 @@ from websockets.exceptions import ConnectionClosed
 
 from .platform_io import (
     CapturedFrame,
+    DisplayInhibitor,
     ScreenCapture,
     get_clipboard,
     key_event,
@@ -142,6 +143,7 @@ class PeerSession:
         self._send_lock = asyncio.Lock()
         self._switch_lock = asyncio.Lock()
         self._producer: CaptureProducer | None = None
+        self._display_inhibitor = DisplayInhibitor()
         self._frame_task: asyncio.Task[None] | None = None
         self._outbound_task: asyncio.Task[None] | None = None
         self._send_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=512)
@@ -393,6 +395,13 @@ class PeerSession:
             raise
 
         self._producer = producer
+        try:
+            await asyncio.to_thread(self._display_inhibitor.start)
+        except Exception as exc:
+            # Remote control should still work if the OS refuses an idle
+            # inhibitor (for example due to local policy); report it but do not
+            # fail the session.
+            self.status_callback(f"Remote control active; unable to block idle sleep: {exc}")
         self.role = "controlled"
         self._clear_outbound()
         info: dict[str, Any] = {
@@ -433,6 +442,8 @@ class PeerSession:
         self._producer = None
         if producer:
             await asyncio.to_thread(producer.stop)
+
+        await asyncio.to_thread(self._display_inhibitor.stop)
 
     async def _frame_sender(self, producer: CaptureProducer) -> None:
         while True:
