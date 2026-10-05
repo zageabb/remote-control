@@ -4,6 +4,8 @@ import ctypes
 import io
 import platform
 import socket
+import subprocess
+import threading
 from dataclasses import dataclass
 
 import mss
@@ -20,6 +22,7 @@ if _IS_WINDOWS:
     from ctypes import wintypes
 
     _user32 = ctypes.windll.user32
+    _kernel32 = ctypes.windll.kernel32
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(2)
     except Exception:
@@ -93,6 +96,8 @@ if _IS_WINDOWS:
         ctypes.c_int,
     ]
     _user32.SendInput.restype = wintypes.UINT
+    _kernel32.SetThreadExecutionState.argtypes = [wintypes.DWORD]
+    _kernel32.SetThreadExecutionState.restype = wintypes.DWORD
 
     _MOUSE_FLAGS = {
         ("left", True): 0x0002,
@@ -153,6 +158,101 @@ if _IS_WINDOWS:
     # combinations such as Ctrl+C / Alt+F continue to work normally.
     _SHORTCUT_MODIFIERS = {"ctrl", "alt", "win", "command"}
     _WIN_MODIFIERS_DOWN: set[str] = set()
+
+
+class DisplayInhibitor:
+    """Prevent idle sleep/display blanking while this computer is controlled.
+
+    The inhibitor is deliberately session-scoped. On Windows,
+    SetThreadExecutionState is thread-local, so a small dedicated thread owns
+    the assertion and clears it on that same thread when the session ends.
+    On macOS, caffeinate provides the equivalent process-scoped assertions.
+    Other platforms currently fall back to a harmless no-op.
+    """
+
+    _ES_CONTINUOUS = 0x80000000
+    _ES_SYSTEM_REQUIRED = 0x00000001
+    _ES_DISPLAY_REQUIRED = 0x00000002
+
+    def __init__(self) -> None:
+        self._stop = threading.Event()
+        self._started = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._process: subprocess.Popen[bytes] | None = None
+        self.error: Exception | None = None
+
+    @property
+    def active(self) -> bool:
+        if _IS_WINDOWS:
+            return bool(self._thread and self._thread.is_alive() and self._started.is_set())
+        if platform.system() == "Darwin":
+            return bool(self._process and self._process.poll() is None)
+        return False
+
+    def start(self) -> None:
+        if self.active:
+            return
+
+        self.error = None
+        if _IS_WINDOWS:
+            self._stop.clear()
+            self._started.clear()
+            self._thread = threading.Thread(
+                target=self._run_windows,
+                name="display-inhibitor",
+                daemon=True,
+            )
+            self._thread.start()
+            if not self._started.wait(timeout=2):
+                raise TimeoutError("Display inhibitor did not start")
+            if self.error:
+                raise self.error
+            return
+
+        if platform.system() == "Darwin":
+            self._process = subprocess.Popen(
+                ["caffeinate", "-d", "-i"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+    def stop(self) -> None:
+        if _IS_WINDOWS:
+            self._stop.set()
+            thread = self._thread
+            if thread and thread.is_alive():
+                thread.join(timeout=2)
+            self._thread = None
+            self._started.clear()
+            return
+
+        process = self._process
+        self._process = None
+        if process and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+
+    def _run_windows(self) -> None:
+        flags = (
+            self._ES_CONTINUOUS
+            | self._ES_SYSTEM_REQUIRED
+            | self._ES_DISPLAY_REQUIRED
+        )
+        try:
+            if not _kernel32.SetThreadExecutionState(flags):
+                raise OSError("Windows refused the display execution-state request")
+            self._started.set()
+            self._stop.wait()
+        except Exception as exc:
+            self.error = exc
+            self._started.set()
+        finally:
+            # SetThreadExecutionState is thread-local; clear the assertion from
+            # this same thread so the user's normal power policy resumes.
+            _kernel32.SetThreadExecutionState(self._ES_CONTINUOUS)
 
 
 @dataclass(slots=True)
