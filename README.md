@@ -16,6 +16,7 @@ A small cross-platform LAN remote-control prototype written in Python. The same 
 - Clipboard send/get.
 - Shared access-token authentication.
 - Remote screen automatically scaled to fit the viewer.
+- Connection, direction and zoom controls collapse automatically after connecting, leaving more room for the remote screen. Select **Show controls** to access them again; they reopen after disconnection.
 - **Control direction can be reversed over the same existing WebSocket connection.**
 - One listening host accepts one active peer at a time.
 

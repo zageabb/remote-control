@@ -175,7 +175,10 @@ class RemoteControlApp(tk.Tk):
     def _build_control_tab(self) -> None:
         frame = self.control_tab
         frame.columnconfigure(0, weight=1)
-        frame.rowconfigure(3, weight=1)
+        frame.rowconfigure(4, weight=1)
+        self.controls_collapsed = False
+        self.controls_toggle = ttk.Button(frame, text="Hide controls ▲", command=self._toggle_controls)
+        self.controls_toggle.grid(row=0, column=0, sticky="w", pady=(0, 6))
 
         self.connect_host = tk.StringVar(value="")
         self.connect_port = tk.StringVar(value=str(DEFAULT_PORT))
@@ -184,7 +187,8 @@ class RemoteControlApp(tk.Tk):
         self.control_direction = tk.StringVar(value="No active remote-control session")
 
         toolbar = ttk.Frame(frame)
-        toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        self.connection_toolbar = toolbar
+        toolbar.grid(row=1, column=0, sticky="ew", pady=(0, 8))
         toolbar.columnconfigure(1, weight=1)
         ttk.Label(toolbar, text="Host").grid(row=0, column=0, padx=(0, 4))
         ttk.Entry(toolbar, textvariable=self.connect_host, width=18).grid(
@@ -202,7 +206,8 @@ class RemoteControlApp(tk.Tk):
         self.disconnect_btn.grid(row=0, column=7, padx=(8, 0))
 
         direction_bar = ttk.Frame(frame)
-        direction_bar.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        self.direction_toolbar = direction_bar
+        direction_bar.grid(row=2, column=0, sticky="ew", pady=(0, 8))
         ttk.Label(
             direction_bar,
             textvariable=self.control_direction,
@@ -217,11 +222,12 @@ class RemoteControlApp(tk.Tk):
         self.take_control_btn.pack(side="right")
 
         viewer_toolbar = ttk.Frame(frame)
-        viewer_toolbar.grid(row=2, column=0, sticky="ew", pady=(0, 6))
+        self.viewer_toolbar = viewer_toolbar
+        viewer_toolbar.grid(row=3, column=0, sticky="ew", pady=(0, 6))
         self._populate_viewer_toolbar(viewer_toolbar, fullscreen=False)
 
         viewer_border = ttk.Frame(frame, relief="sunken", borderwidth=1)
-        viewer_border.grid(row=3, column=0, sticky="nsew")
+        viewer_border.grid(row=4, column=0, sticky="nsew")
         viewer_border.rowconfigure(0, weight=1)
         viewer_border.columnconfigure(0, weight=1)
 
@@ -235,10 +241,26 @@ class RemoteControlApp(tk.Tk):
         self._update_scrollbars(self.canvas)
 
         footer = ttk.Frame(frame)
-        footer.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+        footer.grid(row=5, column=0, sticky="ew", pady=(8, 0))
         ttk.Label(footer, textvariable=self.client_status).pack(side="left")
         ttk.Button(footer, text="Send clipboard", command=self._send_clipboard).pack(side="right")
         ttk.Button(footer, text="Get clipboard", command=self._get_clipboard).pack(side="right", padx=(0, 8))
+
+    def _toggle_controls(self) -> None:
+        self._set_controls_collapsed(not self.controls_collapsed)
+
+    def _set_controls_collapsed(self, collapsed: bool) -> None:
+        """Hide the setup and viewer toolbars without losing connection settings."""
+        if self.controls_collapsed == collapsed:
+            return
+        self.controls_collapsed = collapsed
+        for toolbar in (self.connection_toolbar, self.direction_toolbar, self.viewer_toolbar):
+            if collapsed:
+                toolbar.grid_remove()
+            else:
+                toolbar.grid()
+        self.controls_toggle.configure(text="Show controls ▼" if collapsed else "Hide controls ▲")
+        self.after_idle(self._redraw_last_frame)
 
     def _populate_viewer_toolbar(self, parent: ttk.Frame, *, fullscreen: bool) -> None:
         ttk.Button(parent, text="Fit", command=self._zoom_fit).pack(side="left")
@@ -446,6 +468,7 @@ class RemoteControlApp(tk.Tk):
         elif self.host_service and self.host_service.connected:
             self.host_service.disconnect_peer()
         self._clear_remote_view("Not connected")
+        self._set_controls_collapsed(False)
         self.connect_btn.config(state="normal")
         self.disconnect_btn.config(state="disabled")
         self.client_status.set("Not connected")
@@ -496,6 +519,7 @@ class RemoteControlApp(tk.Tk):
                     self.client_status.set(text)
                     self.global_status.set(text)
                     if text == "Disconnected" or text.startswith("Client error:"):
+                        self._set_controls_collapsed(False)
                         self.connect_btn.config(state="normal")
                         self.disconnect_btn.config(state="disabled")
                 elif kind == "session_message":
@@ -543,6 +567,7 @@ class RemoteControlApp(tk.Tk):
                 f"Controlling {remote_name} • {width}×{height} • {message.get('fps', '?')} fps"
             )
             self.global_status.set(f"Control direction: {direction}")
+            self._set_controls_collapsed(True)
             if source == "host":
                 self.host_role.set(f"This computer is controlling {remote_name}")
                 self.notebook.select(self.control_tab)
@@ -560,6 +585,7 @@ class RemoteControlApp(tk.Tk):
                 "Remote peer is controlling this computer.\nPress 'Take control' to reverse the same connection."
             )
             self.global_status.set(f"Control direction: {direction}")
+            self._set_controls_collapsed(True)
             if source == "host":
                 self.host_role.set(f"{remote_name} is controlling this computer")
 
@@ -570,6 +596,7 @@ class RemoteControlApp(tk.Tk):
                 self.host_role.set("Requesting control of connected computer…")
 
         elif role == "disconnected":
+            self._set_controls_collapsed(False)
             if self.active_source == source:
                 self._clear_remote_view("Peer disconnected")
             if source == "host":
